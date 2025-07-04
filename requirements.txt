@@ -1,0 +1,8 @@
+telebot
+requests
+eth-account
+mnemonic
+bitcoinlib
+solana
+tronpy
+web3
