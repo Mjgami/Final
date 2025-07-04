@@ -1,8 +1,8 @@
 telebot
-requests
-eth-account
 mnemonic
-bitcoinlib
-solana
+eth-account
+requests
 tronpy
+solana
+bitcoinlib
 web3
