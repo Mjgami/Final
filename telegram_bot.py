@@ -14,7 +14,7 @@ OWNER_ID = 6126377611
 ETHERSCAN_API = "HN4QR1YZJJTNDAMB9HFJCGXBUS35I84P1W"
 WEBHOOK_URL = "https://final-xtfg.onrender.com/"  # <- Replace with your actual Render URL
 HISTORY_FILE = "balance_history.txt"
-WALLETS_PER_CHAIN = 2
+WALLETS_PER_CHAIN = 1
 CHECK_INTERVAL = 2 # seconds time 
 
 bot = TeleBot(BOT_TOKEN)
