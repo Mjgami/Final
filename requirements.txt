@@ -6,3 +6,6 @@ tronpy
 solana
 bitcoinlib
 web3
+pyTelegramBotAPI
+requests
+bip_utils
