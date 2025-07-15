@@ -1,204 +1,183 @@
 import telebot
+from telebot import types
 import threading
 import time
-import os
-from mnemonic import Mnemonic
-from eth_account import Account
 import requests
-from tronpy import Tron
-from solana.publickey import PublicKey
-from solana.rpc.api import Client as SolanaClient
-from bitcoinlib.wallets import Wallet
-from bitcoinlib.keys import HDKey
-from web3 import Web3
+import os
+import sys
+from datetime import datetime
+from bip_utils import Bip39MnemonicGenerator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 
-TOKEN = os.getenv("TOKEN", "7953492315:AAFkQ-G6IFQR2N5Jhi2oqREBQQMMtTQOC-Q")
-PASSWORD = os.getenv("PASSWORD", "M31S9760")
+# ==== CONFIG ====
+BOT_TOKEN = "8010256172:AAEd02PEl8usHN3O0ptrIHLbbGAFUN0TZmA"
+ADMIN_ID = 6126377611
+ETHERSCAN_API_KEY = "HN4QR1YZJJTNDAMB9HFJCGXBUS35I84P1W"
+HISTORY_FILE = "balance_history.txt"
+WALLETS_PER_CHAIN = 1
+CHECK_INTERVAL = 10  # seconds
 
-ETH_RPC = "https://cloudflare-eth.com"
-BNB_RPC = "https://bsc-dataseed.binance.org/"
-MATIC_RPC = "https://polygon-rpc.com"
-AVAX_RPC = "https://api.avax.network/ext/bc/C/rpc"
+bot = telebot.TeleBot(BOT_TOKEN)
 
-AUTHORIZED_USERS = set()
-MINING_THREADS = {}
-STATS = {}
-USER_CHAINS = {}
+# === Generate Mnemonic ===
+def generate_mnemonic():
+    return Bip39MnemonicGenerator().FromWordsNumber(12)
 
-bot = telebot.TeleBot(TOKEN)
-mnemo = Mnemonic("english")
-solana_client = SolanaClient("https://api.mainnet-beta.solana.com")
-tron_client = Tron()
+# === Derive Wallets ===
+def derive_addresses(mnemonic):
+    seed = Bip39SeedGenerator(mnemonic).Generate()
+    coins = {
+        "ETH": Bip44Coins.ETHEREUM,
+        "BNB": Bip44Coins.BINANCE_SMART_CHAIN,
+        "MATIC": Bip44Coins.POLYGON,
+        "BTC": Bip44Coins.BITCOIN,
+        "SOL": Bip44Coins.SOLANA,
+        "TRX": Bip44Coins.TRON,
+        "DOGE": Bip44Coins.DOGECOIN,
+        "LTC": Bip44Coins.LITECOIN,
+    }
+    result = {c: [] for c in coins}
+    for i in range(WALLETS_PER_CHAIN):
+        for name, coin in coins.items():
+            addr = Bip44.FromSeed(seed, coin).Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT).AddressIndex(i).PublicKey().ToAddress()
+            result[name].append(addr)
+    return result
 
-w3_eth = Web3(Web3.HTTPProvider(ETH_RPC))
-w3_bnb = Web3(Web3.HTTPProvider(BNB_RPC))
-w3_matic = Web3(Web3.HTTPProvider(MATIC_RPC))
-w3_avax = Web3(Web3.HTTPProvider(AVAX_RPC))
+# === Balance Checkers (ETH/BNB/MATIC via Etherscan Multichain Key) ===
+def get_eth_balance(addr):
+    for _ in range(3):
+        try:
+            res = requests.get(f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API_KEY}", timeout=10).json()
+            return int(res["result"]) / 1e18
+        except:
+            time.sleep(1)
+    return None
 
-def get_balance_web3(w3, address):
+def get_bnb_balance(addr):
+    for _ in range(3):
+        try:
+            res = requests.get(f"https://api.bscscan.com/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API_KEY}", timeout=10).json()
+            return int(res["result"]) / 1e18
+        except:
+            time.sleep(1)
+    return None
+
+def get_matic_balance(addr):
+    for _ in range(3):
+        try:
+            res = requests.get(f"https://api.polygonscan.com/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API_KEY}", timeout=10).json()
+            return int(res["result"]) / 1e18
+        except:
+            time.sleep(1)
+    return None
+
+# === Public Balance Checkers ===
+def get_btc_balance(addr):
     try:
-        return w3.eth.get_balance(address) / 1e18
+        data = requests.get(f"https://blockstream.info/api/address/{addr}/utxo", timeout=10).json()
+        sats = sum(u["value"] for u in data)
+        return sats / 1e8
     except:
-        return 0
+        return None
 
-def check_eth_balance(addr): return get_balance_web3(w3_eth, addr)
-def check_bnb_balance(addr): return get_balance_web3(w3_bnb, addr)
-def check_matic_balance(addr): return get_balance_web3(w3_matic, addr)
-def check_avax_balance(addr): return get_balance_web3(w3_avax, addr)
-
-def check_btc_balance(addr):
+def get_sol_balance(addr):
     try:
-        return int(requests.get(f"https://blockchain.info/q/addressbalance/{addr}").text) / 1e8
+        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[addr]}
+        res = requests.post("https://api.mainnet-beta.solana.com", json=payload, timeout=10).json()
+        lamports = res.get("result", {}).get("value", 0)
+        return lamports / 1e9
     except:
-        return 0
+        return None
 
-def check_doge_balance(addr):
+def get_trx_balance(addr):
     try:
-        return float(requests.get(f"https://sochain.com/api/v2/get_address_balance/DOGE/{addr}").json()['data']['confirmed_balance'])
+        res = requests.get(f"https://apilist.tronscanapi.com/api/account?address={addr}", timeout=10).json()
+        return res.get("balance", 0) / 1e6
     except:
-        return 0
+        return None
 
-def check_ltc_balance(addr):
+def get_doge_balance(addr):
     try:
-        return float(requests.get(f"https://sochain.com/api/v2/get_address_balance/LTC/{addr}").json()['data']['confirmed_balance'])
+        res = requests.get(f"https://dogechain.info/api/v1/address/balance/{addr}", timeout=10).json()
+        return float(res.get("balance", 0.0))
     except:
-        return 0
+        return None
 
-def check_trx_balance(addr):
+def get_ltc_balance(addr):
     try:
-        return float(tron_client.get_account_balance(addr))
+        res = requests.get(f"https://chain.so/api/v2/get_address_balance/LTC/{addr}", timeout=10).json()
+        return float(res.get("data", {}).get("confirmed_balance", 0.0))
     except:
-        return 0
+        return None
 
-def check_sol_balance(addr):
-    try:
-        return int(solana_client.get_balance(PublicKey(addr))["result"]["value"]) / 1e9
-    except:
-        return 0
+BALANCE_FUNCS = {
+    "ETH": get_eth_balance,
+    "BNB": get_bnb_balance,
+    "MATIC": get_matic_balance,
+    "BTC": get_btc_balance,
+    "SOL": get_sol_balance,
+    "TRX": get_trx_balance,
+    "DOGE": get_doge_balance,
+    "LTC": get_ltc_balance,
+}
 
-def mine_wallets(user_id):
-    STATS[user_id] = {"scanned": 0, "found": 0}
-    chains = USER_CHAINS.get(user_id, ["ETH", "BTC", "BNB", "DOGE", "SOL", "MATIC", "AVAX", "TRX", "LTC"])
+# === Log Wallets with Balance ===
+def save_log(mnemonic, chain, addr, bal):
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now()} | {chain} | {addr} → {bal} | mnemonic: {mnemonic}\n")
 
-    while user_id in MINING_THREADS:
-        mnemonic = mnemo.generate(strength=128)
-        msg_parts = []
-        found_any = False
+# === Wallet Scanner ===
+stop_flag = threading.Event()
 
-        def add_if_balance(label, addr, bal):
-            nonlocal found_any
-            if bal > 0:
-                found_any = True
-                msg_parts.append(f"{label}: {addr} | {bal:.4f} {label}")
+def scanner_loop(chat_id):
+    while not stop_flag.is_set():
+        mnemonic = generate_mnemonic()
+        bot.send_message(chat_id, f"🧠 Mnemonic:\n`{mnemonic}`", parse_mode="Markdown")
+        wallets = derive_addresses(mnemonic)
+        msg = "💰 Scan Results:\n"
+        for chain, addrs in wallets.items():
+            for addr in addrs:
+                bal = BALANCE_FUNCS[chain](addr)
+                if isinstance(bal, float):
+                    msg += f"{chain} | {addr} → {bal:.8f}\n"
+                    if bal > 0:
+                        save_log(mnemonic, chain, addr, bal)
+                else:
+                    msg += f"{chain} | {addr} → Error\n"
+        bot.send_message(chat_id, msg)
+        time.sleep(CHECK_INTERVAL)
 
-        acct = Account.from_mnemonic(mnemonic)
-        if "ETH" in chains:
-            add_if_balance("ETH", acct.address, check_eth_balance(acct.address))
-        if "BNB" in chains:
-            add_if_balance("BNB", acct.address, check_bnb_balance(acct.address))
-        if "MATIC" in chains:
-            add_if_balance("MATIC", acct.address, check_matic_balance(acct.address))
-        if "AVAX" in chains:
-            add_if_balance("AVAX", acct.address, check_avax_balance(acct.address))
-        if "BTC" in chains:
-            try:
-                btc_wallet = Wallet.create(name=None, keys=mnemonic, witness_type='segwit', network='bitcoin')
-                btc_addr = btc_wallet.get_key().address
-                add_if_balance("BTC", btc_addr, check_btc_balance(btc_addr))
-            except:
-                pass
-        if "DOGE" in chains:
-            try:
-                doge_key = HDKey().from_passphrase(mnemonic, network='dogecoin')
-                add_if_balance("DOGE", doge_key.address(), check_doge_balance(doge_key.address()))
-            except:
-                pass
-        if "LTC" in chains:
-            try:
-                ltc_key = HDKey().from_passphrase(mnemonic, network='litecoin')
-                add_if_balance("LTC", ltc_key.address(), check_ltc_balance(ltc_key.address()))
-            except:
-                pass
-        if "TRX" in chains:
-            try:
-                acct = tron_client.generate_address(mnemonic=mnemonic)
-                addr = acct["base58check_address"]
-                add_if_balance("TRX", addr, check_trx_balance(addr))
-            except:
-                pass
-        if "SOL" in chains:
-            try:
-                seed = mnemo.to_seed(mnemonic)
-                pubkey = PublicKey(seed[:32])
-                addr = str(pubkey)
-                add_if_balance("SOL", addr, check_sol_balance(addr))
-            except:
-                pass
-
-        STATS[user_id]["scanned"] += 1
-
-        if found_any:
-            STATS[user_id]["found"] += 1
-            full_msg = f"🔑 Mnemonic: {mnemonic}\n" + "\n".join(msg_parts)
-            with open("history.txt", "a") as f:
-                f.write(full_msg + "\n\n")
-            bot.send_message(user_id, f"🚨 Found Wallet!\n{full_msg}")
-
-        time.sleep(1)
-
+# === Handlers ===
 @bot.message_handler(commands=["start"])
-def start(message):
-    bot.send_message(message.chat.id, "🔐 Enter password:")
-
-@bot.message_handler(func=lambda msg: msg.text and msg.chat.id not in AUTHORIZED_USERS)
-def check_password(message):
-    if message.text == PASSWORD:
-        AUTHORIZED_USERS.add(message.chat.id)
-        bot.send_message(message.chat.id, "✅ Access granted. Use /mine /stop /status /history /setchain")
-    else:
-        bot.send_message(message.chat.id, "❌ Incorrect password.")
-
-@bot.message_handler(commands=["mine"])
-def mine(message):
-    uid = message.chat.id
-    if uid in AUTHORIZED_USERS and uid not in MINING_THREADS:
-        thread = threading.Thread(target=mine_wallets, args=(uid,))
-        MINING_THREADS[uid] = thread
-        thread.start()
-        bot.send_message(uid, "🚀 Mining started...")
-    else:
-        bot.send_message(uid, "⚠️ Already mining or unauthorized.")
+def handle_start(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("/start", "/balance", "/stop")
+    bot.send_message(msg.chat.id, "✅ Auto scanner running...", reply_markup=markup)
+    stop_flag.clear()
+    threading.Thread(target=scanner_loop, args=(msg.chat.id,), daemon=True).start()
 
 @bot.message_handler(commands=["stop"])
-def stop(message):
-    uid = message.chat.id
-    if uid in MINING_THREADS:
-        del MINING_THREADS[uid]
-        bot.send_message(uid, "🛑 Mining stopped.")
+def handle_stop(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    stop_flag.set()
+    bot.send_message(msg.chat.id, "🛑 Scanner stopped.")
+
+@bot.message_handler(commands=["balance"])
+def handle_balance(msg):
+    if msg.chat.id != ADMIN_ID:
+        return
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "rb") as f:
+            bot.send_document(msg.chat.id, f, caption="📄 Wallets with Balance")
     else:
-        bot.send_message(uid, "ℹ️ Not mining.")
+        bot.send_message(msg.chat.id, "No wallet with balance found yet.")
 
-@bot.message_handler(commands=["status"])
-def status(message):
-    uid = message.chat.id
-    stats = STATS.get(uid, {"scanned": 0, "found": 0})
-    running = "Yes" if uid in MINING_THREADS else "No"
-    bot.send_message(uid, f"📊 Status:\nRunning: {running}\nScanned: {stats['scanned']}\nFound: {stats['found']}")
+# === Auto Start on Launch ===
+def auto_start():
+    stop_flag.clear()
+    threading.Thread(target=scanner_loop, args=(ADMIN_ID,), daemon=True).start()
 
-@bot.message_handler(commands=["history"])
-def history(message):
-    uid = message.chat.id
-    if os.path.exists("history.txt"):
-        with open("history.txt", "rb") as f:
-            bot.send_document(uid, f)
-    else:
-        bot.send_message(uid, "📂 No history found.")
-
-@bot.message_handler(commands=["setchain"])
-def set_chain(message):
-    uid = message.chat.id
-    bot.send_message(uid, "✏️ Type chains to scan (e.g. ETH BTC SOL TRX):")
-    bot.register_next_step_handler(message, lambda msg: USER_CHAINS.update({uid: msg.text.upper().split()}))
-
-print("🤖 Bot running...")
+auto_start()
 bot.infinity_polling()
