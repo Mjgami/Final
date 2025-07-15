@@ -4,34 +4,31 @@ import time
 import requests
 import os
 import sys
-from datetime import datetime
 from flask import Flask
-from bip_utils import (
-    Bip39MnemonicGenerator, Bip39SeedGenerator,
-    Bip44, Bip44Coins, Bip44Changes
-)
+from datetime import datetime
+from bip_utils import Bip39MnemonicGenerator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes, Bip44Depth, Bip44Levels
 
 # === CONFIGURATION ===
 BOT_TOKEN = "8010256172:AAEd02PEl8usHN3O0ptrIHLbbGAFUN0TZmA"
-OWNER_ID = 6126377611  # <-- Replace with your Telegram user ID
+OWNER_ID = 6126377611  # your Telegram user ID
 ETHERSCAN_API = "HN4QR1YZJJTNDAMB9HFJCGXBUS35I84P1W"
 WALLETS_PER_CHAIN = 2
-CHECK_INTERVAL = 2
+CHECK_INTERVAL = 2  # seconds
 HISTORY_FILE = "balance_history.txt"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 scanning_threads = {}
-wallet_stats = {"total": 0, "last_check": "N/A"}
+wallet_stats = {"total": 0, "last_check": "Never"}
 
-# === Generate Mnemonic ===
+# === GENERATE MNEMONIC ===
 def generate_mnemonic():
     return Bip39MnemonicGenerator().FromWordsNumber(12)
 
-# === Derive Addresses ===
-def derive_addresses(mnemonic):
+# === DERIVE ADDRESSES ===
+def derive_wallets(mnemonic):
     seed = Bip39SeedGenerator(mnemonic).Generate()
-    chains = {
+    coins = {
         "ETH": Bip44Coins.ETHEREUM,
         "BNB": Bip44Coins.BINANCE_SMART_CHAIN,
         "MATIC": Bip44Coins.POLYGON,
@@ -41,86 +38,65 @@ def derive_addresses(mnemonic):
         "DOGE": Bip44Coins.DOGECOIN,
         "LTC": Bip44Coins.LITECOIN,
     }
-    wallets = {chain: [] for chain in chains}
-    for i in range(WALLETS_PER_CHAIN):
-        for name, coin in chains.items():
-            try:
-                addr = Bip44.FromSeed(seed, coin).Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT).AddressIndex(i).PublicKey().ToAddress()
-                wallets[name].append(addr)
-            except:
-                wallets[name].append("ERROR")
+    wallets = {c: [] for c in coins}
+    for chain, coin in coins.items():
+        bip = Bip44.FromSeed(seed, coin).Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT)
+        for i in range(WALLETS_PER_CHAIN):
+            w = bip.AddressIndex(i)
+            wallets[chain].append({
+                "address": w.PublicKey().ToAddress(),
+                "private": w.PrivateKey().ToWif()
+            })
     return wallets
 
-# === Balance Checkers ===
-def retry_request(url, retries=3):
-    for _ in range(retries):
+# === BALANCE CHECKERS ===
+def retry_request(url, tries=3):
+    for _ in range(tries):
         try:
-            return requests.get(url, timeout=10).json()
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            time.sleep(1)
+    return {}
+
+def get_eth_balance(addr):  # ETH, BNB, MATIC
+    url = f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API}"
+    res = retry_request(url)
+    return int(res.get("result", 0)) / 1e18 if "result" in res else None
+
+def get_btc_balance(addr):
+    res = retry_request(f"https://blockstream.info/api/address/{addr}/utxo")
+    sats = sum(i["value"] for i in res) if isinstance(res, list) else 0
+    return sats / 1e8
+
+def get_sol_balance(addr):
+    data = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [addr]}
+    for _ in range(3):
+        try:
+            r = requests.post("https://api.mainnet-beta.solana.com", json=data, timeout=10).json()
+            return r["result"]["value"] / 1e9
         except:
             time.sleep(1)
     return None
 
-def get_eth_balance(addr):
-    data = retry_request(f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API}")
-    try:
-        return int(data.get("result", "0")) / 1e18
-    except:
-        return None
-
-def get_bnb_balance(addr):
-    data = retry_request(f"https://api.bscscan.com/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API}")
-    try:
-        return int(data.get("result", "0")) / 1e18
-    except:
-        return None
-
-def get_matic_balance(addr):
-    data = retry_request(f"https://api.polygonscan.com/api?module=account&action=balance&address={addr}&tag=latest&apikey={ETHERSCAN_API}")
-    try:
-        return int(data.get("result", "0")) / 1e18
-    except:
-        return None
-
-def get_btc_balance(addr):
-    data = retry_request(f"https://blockstream.info/api/address/{addr}/utxo")
-    try:
-        return sum(u["value"] for u in data) / 1e8
-    except:
-        return None
-
-def get_sol_balance(addr):
-    try:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [addr]}
-        res = requests.post("https://api.mainnet-beta.solana.com", json=payload, timeout=10).json()
-        return int(res.get("result", {}).get("value", 0)) / 1e9
-    except:
-        return None
-
 def get_trx_balance(addr):
-    data = retry_request(f"https://apilist.tronscanapi.com/api/account?address={addr}")
-    try:
-        return int(data.get("balance", 0)) / 1e6
-    except:
-        return None
+    url = f"https://apilist.tronscanapi.com/api/account?address={addr}"
+    res = retry_request(url)
+    return res.get("balance", 0) / 1e6 if "balance" in res else 0
 
 def get_doge_balance(addr):
-    data = retry_request(f"https://dogechain.info/api/v1/address/balance/{addr}")
-    try:
-        return float(data.get("balance", 0.0))
-    except:
-        return None
+    res = retry_request(f"https://dogechain.info/api/v1/address/balance/{addr}")
+    return float(res.get("balance", 0.0)) if "balance" in res else None
 
 def get_ltc_balance(addr):
-    data = retry_request(f"https://chain.so/api/v2/get_address_balance/LTC/{addr}")
-    try:
-        return float(data.get("data", {}).get("confirmed_balance", 0.0))
-    except:
-        return None
+    res = retry_request(f"https://chain.so/api/v2/get_address_balance/LTC/{addr}")
+    return float(res.get("data", {}).get("confirmed_balance", 0.0)) if "data" in res else None
 
 BALANCE_FUNCS = {
     "ETH": get_eth_balance,
-    "BNB": get_bnb_balance,
-    "MATIC": get_matic_balance,
+    "BNB": get_eth_balance,
+    "MATIC": get_eth_balance,
     "BTC": get_btc_balance,
     "SOL": get_sol_balance,
     "TRX": get_trx_balance,
@@ -128,43 +104,42 @@ BALANCE_FUNCS = {
     "LTC": get_ltc_balance,
 }
 
-# === Logging ===
-def save_log(mnemonic, chain, addr, bal):
+# === SAVE RESULTS ===
+def save_log(mnemonic, privkey, chain, addr, balance):
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now()} | {chain} | {addr} → {bal}\n")
+        f.write(f"[{datetime.now()}] {chain} | {addr} → {balance}\nMnemonic: {mnemonic}\nPrivate Key: {privkey}\n{'-'*50}\n")
 
-# === Scanner ===
-def scanner_loop(chat_id):
+# === SCAN LOOP ===
+def scanner(chat_id):
     scanning_threads[chat_id] = True
-    while scanning_threads.get(chat_id):
+    while scanning_threads[chat_id]:
         mnemonic = generate_mnemonic()
         bot.send_message(chat_id, f"🧠 Mnemonic:\n`{mnemonic}`", parse_mode="Markdown")
-        wallets = derive_addresses(mnemonic)
-        result = "💰 Scan Results:\n"
+        wallets = derive_wallets(mnemonic)
+        msg = "💰 Scan Results:\n"
         wallet_stats["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for chain, addresses in wallets.items():
-            for addr in addresses:
-                if addr == "ERROR":
-                    result += f"{chain} | Address Derivation Error\n"
-                    continue
-                balance = BALANCE_FUNCS.get(chain, lambda x: None)(addr)
-                bal_str = f"{balance:.8f}" if isinstance(balance, float) else "Error"
-                result += f"{chain} | {addr} → {bal_str}\n"
+        for chain, items in wallets.items():
+            for w in items:
+                addr, priv = w["address"], w["private"]
+                bal = BALANCE_FUNCS[chain](addr)
                 wallet_stats["total"] += 1
-                if isinstance(balance, float) and balance > 0:
-                    save_log(mnemonic, chain, addr, bal_str)
-        bot.send_message(chat_id, result)
+                b = f"{bal:.8f}" if isinstance(bal, float) else "Error"
+                msg += f"{chain} | {addr} → {b}\n"
+                if isinstance(bal, float) and bal > 0:
+                    save_log(mnemonic, priv, chain, addr, b)
+        bot.send_message(chat_id, msg)
         time.sleep(CHECK_INTERVAL)
 
-# === Commands ===
+# === TELEGRAM COMMANDS ===
 markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-markup.row('/start', '/stop', '/balance', '/status', '/speed')
+markup.add("/start", "/stop", "/balance", "/status", "/speed")
 
 @bot.message_handler(commands=['start'])
 def start(msg):
     if msg.chat.id != OWNER_ID: return
-    bot.send_message(msg.chat.id, "🚀 Scanner started.", reply_markup=markup)
-    threading.Thread(target=scanner_loop, args=(msg.chat.id,), daemon=True).start()
+    if scanning_threads.get(msg.chat.id): return
+    bot.send_message(msg.chat.id, "🔄 Scanning started...", reply_markup=markup)
+    threading.Thread(target=scanner, args=(msg.chat.id,), daemon=True).start()
 
 @bot.message_handler(commands=['stop'])
 def stop(msg):
@@ -185,25 +160,25 @@ def balance(msg):
 def status(msg):
     if msg.chat.id != OWNER_ID: return
     running = "✅ Running" if scanning_threads.get(msg.chat.id) else "❌ Stopped"
-    bot.send_message(msg.chat.id, f"🔄 Status: {running}\n🕒 Last Check: {wallet_stats['last_check']}")
+    bot.send_message(msg.chat.id, f"🔄 Status: {running}\n⏱ Last Check: {wallet_stats['last_check']}")
 
 @bot.message_handler(commands=['speed'])
 def speed(msg):
     if msg.chat.id != OWNER_ID: return
     bot.send_message(msg.chat.id, f"⚡ Wallets Checked: {wallet_stats['total']}")
 
-# === Auto Start ===
+# === AUTO START FOR OWNER_ID ===
 def auto_start():
-    bot.send_message(OWNER_ID, "👋 Auto-started and scanning.")
-    threading.Thread(target=scanner_loop, args=(OWNER_ID,), daemon=True).start()
+    bot.send_message(OWNER_ID, "🚀 Auto-scanner started.")
+    threading.Thread(target=scanner, args=(OWNER_ID,), daemon=True).start()
     bot.infinity_polling()
 
-# === Flask Dummy Server for Render ===
+# === FAKE WEB SERVER FOR RENDER ===
 @app.route('/')
-def home():
-    return "Bot Running!"
+def index():
+    return "Bot Running"
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     threading.Thread(target=auto_start).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
